@@ -4,4 +4,4 @@ numpy
 pandas
 scikit-learn
 joblib
-openai>=1.37.0
+assemblyai>=0.33.0

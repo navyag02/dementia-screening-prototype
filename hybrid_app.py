@@ -10,10 +10,9 @@ import string
 from typing import Optional, Tuple
 
 try:
-    # Optional dependency; used only if API key is provided
-    from openai import OpenAI  # type: ignore
+    import assemblyai as aai  # type: ignore
 except Exception:
-    OpenAI = None  # type: ignore
+    aai = None  # type: ignore
 
 # Configure page early (must be before other Streamlit UI calls)
 st.set_page_config(page_title="🧠 Early Dementia Detection", page_icon="🧠", layout="centered")
@@ -58,38 +57,45 @@ def extract_features(filepath: str, label: str = "unknown", task: str = "free") 
 
 
 # -------------------------------
-# Audio transcription via API (OpenAI Whisper-like)
+# Audio transcription via AssemblyAI
 # -------------------------------
-def _get_openai_client() -> Optional[object]:
-    api_key = None
+def _get_assemblyai_api_key() -> Optional[str]:
+    # Prefer Streamlit secrets, fallback to env var
+    key = None
     try:
-        api_key = st.secrets.get("OPENAI_API_KEY", None)  # type: ignore
+        key = st.secrets.get("ASSEMBLYAI_API_KEY", None)  # type: ignore
     except Exception:
-        api_key = None
-    if not api_key:
-        api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key or OpenAI is None:
-        return None
-    try:
-        return OpenAI(api_key=api_key)
-    except Exception:
-        return None
+        key = None
+    if not key:
+        key = os.getenv("ASSEMBLYAI_API_KEY") or os.getenv("AAI_API_KEY")
+    return key
 
 
 def transcribe_audio(file_path: str) -> Tuple[Optional[str], Optional[str]]:
-    """Transcribe audio using OpenAI if API key is set. Returns (text, error)."""
-    client = _get_openai_client()
-    if client is None:
-        return None, "OpenAI client not configured. Set OPENAI_API_KEY to enable transcription."
+    """Transcribe audio using AssemblyAI if API key is set. Returns (text, error)."""
+    api_key = _get_assemblyai_api_key()
+    if not api_key or aai is None:
+        return None, "AssemblyAI not configured. Set ASSEMBLYAI_API_KEY to enable transcription."
+
     try:
-        with open(file_path, "rb") as f:
-            result = client.audio.transcriptions.create(
-                model="gpt-4o-mini-transcribe",
-                file=f,
-            )
-        text = getattr(result, "text", None)
+        # Configure API key
+        try:
+            # Newer SDKs support settings
+            aai.settings.api_key = api_key  # type: ignore[attr-defined]
+            transcriber = aai.Transcriber()  # type: ignore
+        except Exception:
+            # Older SDKs might use Client
+            transcriber = aai.Transcriber(aai.Client(api_key=api_key))  # type: ignore
+
+        transcript = transcriber.transcribe(file_path)  # type: ignore
+        text = getattr(transcript, "text", None)
+        status = getattr(transcript, "status", "completed")
+        error = getattr(transcript, "error", None)
+
+        if status == "error" or (text is None and error):
+            return None, f"Transcription error: {error or 'Unknown error'}"
         if not text:
-            return None, "Transcription API returned no text."
+            return None, "Transcription returned no text."
         return text, None
     except Exception as exc:  # pragma: no cover - network/runtime dependent
         return None, f"Transcription failed: {exc}"
