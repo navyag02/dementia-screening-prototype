@@ -5,30 +5,98 @@ import pandas as pd
 import joblib
 import tempfile
 import random
+import os
+import string
+from typing import Optional, Tuple
 
-# Load trained model
-model = joblib.load("mock_hybrid_model.pkl")
+try:
+    # Optional dependency; used only if API key is provided
+    from openai import OpenAI  # type: ignore
+except Exception:
+    OpenAI = None  # type: ignore
+
+# Configure page early (must be before other Streamlit UI calls)
+st.set_page_config(page_title="🧠 Early Dementia Detection", page_icon="🧠", layout="centered")
+
+
+# -------------------------------
+# Model loading (cached)
+# -------------------------------
+@st.cache_resource
+def load_model() -> Optional[object]:
+    try:
+        return joblib.load("mock_hybrid_model.pkl")
+    except Exception:
+        return None
+
+
+model = load_model()
 
 # -------------------------------
 # Feature extractor
 # -------------------------------
-def extract_features(filepath, label="unknown", task="free"):
+def extract_features(filepath: str, label: str = "unknown", task: str = "free") -> dict:
     y, sr = librosa.load(filepath, sr=16000)
 
     mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
     mfcc_mean = np.mean(mfcc, axis=1)
 
-    energy = np.array([sum(abs(y[i:i+512]**2)) for i in range(0, len(y), 512)])
-    pauses = np.sum(energy < np.percentile(energy, 10))
+    # Energy-based pause estimate (10th percentile threshold)
+    frame_hop = 512
+    energy = np.array([np.sum(y[i:i + frame_hop] ** 2) for i in range(0, len(y), frame_hop)])
+    pauses = int(np.sum(energy < np.percentile(energy, 10)))
 
-    features = {f"mfcc_{i}": mfcc_mean[i] for i in range(len(mfcc_mean))}
+    features = {f"mfcc_{i}": float(mfcc_mean[i]) for i in range(len(mfcc_mean))}
     features.update({
         "pauses": pauses,
         "task": task,
         "label": label,
-        "file": filepath
+        "file": filepath,
+        "duration_sec": float(len(y) / sr),
     })
     return features
+
+
+# -------------------------------
+# Audio transcription via API (OpenAI Whisper-like)
+# -------------------------------
+def _get_openai_client() -> Optional[object]:
+    api_key = None
+    try:
+        api_key = st.secrets.get("OPENAI_API_KEY", None)  # type: ignore
+    except Exception:
+        api_key = None
+    if not api_key:
+        api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key or OpenAI is None:
+        return None
+    try:
+        return OpenAI(api_key=api_key)
+    except Exception:
+        return None
+
+
+def transcribe_audio(file_path: str) -> Tuple[Optional[str], Optional[str]]:
+    """Transcribe audio using OpenAI if API key is set. Returns (text, error)."""
+    client = _get_openai_client()
+    if client is None:
+        return None, "OpenAI client not configured. Set OPENAI_API_KEY to enable transcription."
+    try:
+        with open(file_path, "rb") as f:
+            result = client.audio.transcriptions.create(
+                model="gpt-4o-mini-transcribe",
+                file=f,
+            )
+        text = getattr(result, "text", None)
+        if not text:
+            return None, "Transcription API returned no text."
+        return text, None
+    except Exception as exc:  # pragma: no cover - network/runtime dependent
+        return None, f"Transcription failed: {exc}"
+
+
+def _normalize_text(text: str) -> str:
+    return "".join(ch for ch in text.lower() if ch not in string.punctuation)
 
 # -------------------------------
 # Streamlit UI
@@ -51,30 +119,104 @@ task_type = st.selectbox(
 # AUDIO TASKS
 # -------------------------------
 if "Audio" in task_type:
-    uploaded_file = st.file_uploader("Upload your .wav file", type=["wav"])
+    uploaded_file = st.file_uploader("Upload your audio file", type=["wav", "mp3", "m4a"])
 
     if uploaded_file is not None:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+        suffix = os.path.splitext(uploaded_file.name or "audio.wav")[1] or ".wav"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             tmp.write(uploaded_file.read())
             tmp_path = tmp.name
 
-        feat = extract_features(tmp_path, task=task_type)
-        feat_df = pd.DataFrame([feat]).drop(columns=["file","label","task"])
-
-        pred = model.predict(feat_df)[0]
-        proba = model.predict_proba(feat_df)[0]
+        try:
+            feat = extract_features(tmp_path, task=task_type)
+            feat_df = pd.DataFrame([feat]).drop(columns=["file", "label", "task"])
+        except Exception as e:
+            feat = {"duration_sec": None, "pauses": None}
+            feat_df = None
+            st.warning(f"Feature extraction issue: {e}")
 
         st.subheader("Audio Task Results")
         st.write(f"🧾 **Task:** {task_type}")
-        st.write(f"🧠 **Prediction:** {pred}")
-        st.write(f"📊 **Probabilities:** Healthy = {proba[0]:.2f}, Dementia = {proba[1]:.2f}")
+
+        if model is not None and feat_df is not None:
+            try:
+                pred = model.predict(feat_df)[0]
+                proba = model.predict_proba(feat_df)[0]
+                st.write(f"🧠 **Prediction:** {pred}")
+                st.write(f"📊 **Probabilities:** Healthy = {proba[0]:.2f}, Dementia = {proba[1]:.2f}")
+            except Exception as e:
+                st.warning(f"Model inference failed: {e}")
+        else:
+            st.info("Model not available. Skipping prediction.")
+
+        # --- Transcription via API ---
+        with st.spinner("Transcribing audio (if API key configured)..."):
+            transcript_text, transcript_err = transcribe_audio(tmp_path)
+
+        if transcript_text:
+            st.markdown("---")
+            st.subheader("Transcript")
+            st.write(transcript_text)
+        elif transcript_err:
+            st.info(transcript_err)
+
+        # --- Task-specific analysis using transcript and/or acoustics ---
+        st.markdown("---")
+        st.subheader("Task-specific Analysis")
+
+        duration_sec = feat.get("duration_sec") if isinstance(feat, dict) else None
+        pauses = feat.get("pauses") if isinstance(feat, dict) else None
 
         if "Picture" in task_type:
+            if transcript_text:
+                text = transcript_text
+                word_count = len(text.split())
+                sentence_count = sum(text.count(x) for x in ".!?") or 1
+                st.metric("Word Count", word_count)
+                st.metric("Sentence Count", sentence_count)
             st.info("🖼 Imagine describing a picture (like 'Cookie Theft').")
+
         elif "Memory Recall" in task_type:
-            st.info("🧾 Normally, the app would play a story, then ask recall.")
+            st.info("🧾 Typically, the app would play a story, then ask recall.")
+            if transcript_text:
+                key_points = [
+                    "anna", "florist", "greenville", "tuesday", "blue bus", "42", "10 am",
+                    "market", "apples", "silver key", "leo", "musician", "clock tower",
+                ]
+                normalized = _normalize_text(transcript_text)
+                hits = 0
+                for kp in key_points:
+                    if _normalize_text(kp) in normalized:
+                        hits += 1
+                st.metric("Recall Score", f"{hits} / {len(key_points)} key details")
+                with st.expander("Key points checked"):
+                    st.write(", ".join(f"`{kp}`" for kp in key_points))
+
         elif "Verbal Fluency" in task_type:
-            st.info("🔤 Example: 'Name as many animals as possible in 1 minute.'")
+            if transcript_text and duration_sec and duration_sec > 0:
+                words = [w for w in _normalize_text(transcript_text).split() if w]
+                unique_words = set(words)
+                wpm = int(len(words) / (duration_sec / 60.0))
+                st.metric("Speech Rate", f"{wpm} WPM")
+                st.metric("Unique Words", len(unique_words))
+            if pauses is not None:
+                st.metric("Pause Count (energy-based)", pauses)
+            st.info("🔤 Example prompt: 'Name as many animals as possible in 1 minute.'")
+
+        else:  # Free Speech or other audio tasks
+            if transcript_text:
+                words = transcript_text.split()
+                st.metric("Word Count", len(words))
+            if duration_sec:
+                st.metric("Duration", f"{duration_sec:.1f} sec")
+            if pauses is not None:
+                st.metric("Pause Count (energy-based)", pauses)
+
+        # Clean up temp file
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
 
 # -------------------------------
 # TEXT TASKS
