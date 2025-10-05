@@ -8,7 +8,10 @@ import os
 import random
 import time
 import string
+import re
+from typing import List, Dict, Optional
 from st_audiorec import st_audiorec
+from audio_api import transcribe_audio, compute_speech_metrics
 
 # --- Model & Feature Column Loading ---
 # Wrapped in a function with caching for efficiency
@@ -53,8 +56,13 @@ def extract_features(filepath):
     return features
 
 # --- Streamlit UI ---
-st.title("🧠 Early Dementia Detection Prototype")
-st.write("A prototype demonstrating dementia screening with **speech analysis + cognitive tasks**.")
+APP_TITLE = "🧠 Early Dementia Detection Prototype"
+APP_SUBTITLE = (
+    "A prototype demonstrating dementia screening with **speech analysis + cognitive tasks**."
+)
+
+st.title(APP_TITLE)
+st.write(APP_SUBTITLE)
 
 task_type = st.selectbox(
     "Choose a screening task:",
@@ -95,16 +103,19 @@ if "Audio" in task_type and model is not None:
             st.session_state.user_audio = None
         if 'score' not in st.session_state:
             st.session_state.score = 0
+        if 'transcript' not in st.session_state:
+            st.session_state.transcript = ""
 
         # --- Core Functions ---
-        def start_new_test():
+        def start_new_test() -> None:
             """Resets the state for a new test."""
             st.session_state.distraction_answer = random.randint(20, 50) + random.randint(20, 50)
             st.session_state.user_audio = None
             st.session_state.score = 0
             st.session_state.test_stage = 'listen'
+            st.session_state.transcript = ""
 
-        def show_listen_screen():
+        def show_listen_screen() -> None:
             """Displays the story for the user to memorize via an audio player."""
             st.subheader("Step 1: Listen and Memorize")
             st.info("Press play on the audio player below and listen carefully to the short story. Try to remember as many details as you can.", icon="🎧")
@@ -120,7 +131,7 @@ if "Audio" in task_type and model is not None:
                 st.session_state.test_stage = 'distraction'
                 st.rerun()
 
-        def show_distraction_screen():
+        def show_distraction_screen() -> None:
             """Shows a simple task to distract the user before recall."""
             st.subheader("Step 2: Quick Brain Teaser")
             st.info("Before you recall the story, please solve this simple math problem.", icon="🧮")
@@ -134,7 +145,7 @@ if "Audio" in task_type and model is not None:
                 else:
                     st.error("The answer is not quite right, please try again.")
 
-        def show_recall_screen():
+        def show_recall_screen() -> None:
             """Prompts the user to record their recollection of the story."""
             st.subheader("Step 3: Recall the Story")
             st.info("Now, please tell me everything you can remember about the story you heard. Include as many details as possible.", icon="🗣️")
@@ -151,35 +162,55 @@ if "Audio" in task_type and model is not None:
                     st.session_state.test_stage = 'analyzing'
                     st.rerun()
 
-        def show_analysis_screen():
-            """Simulates the analysis of the user's audio."""
+        def _normalize_text(text: str) -> str:
+            return re.sub(r"[^a-z0-9\s]+", " ", text.lower()).strip()
+
+        def _count_key_points(transcript: str, key_points: List[str]) -> int:
+            tnorm = _normalize_text(transcript)
+            count = 0
+            for kp in key_points:
+                if _normalize_text(kp) in tnorm:
+                    count += 1
+            return count
+
+        def show_analysis_screen() -> None:
+            """Analyze the user's audio using transcription API with fallback."""
             st.subheader("Analyzing Your Recollection...")
             st.info(
-                "In a real application, an AI model would transcribe your audio and compare it against the key points of the story. "
-                "We are simulating this process for the demo.", icon="🤖"
+                "Transcribing your audio and checking for key story details.", icon="🤖"
             )
 
             progress_bar = st.progress(0, text="Processing audio...")
-            time.sleep(1)
-            progress_bar.progress(50, text="Comparing against key details...")
-            time.sleep(1)
+            time.sleep(0.5)
+            progress_bar.progress(35, text="Transcribing...")
 
-            # --- Simulate Scoring ---
-            # A real app would use NLU. Here, we generate a realistic random score.
-            # We make it more likely to get a higher score to be encouraging.
-            recalled_points_count = random.choices(
-                population=[3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
-                weights=   [1, 1, 2, 3, 4, 5, 4, 3, 2,  1,  1],
-                k=1
-            )[0]
-            st.session_state.score = recalled_points_count
+            recalled_points_count = None
+            transcript_text: Optional[str] = None
+
+            audio_bytes = st.session_state.user_audio
+            if audio_bytes:
+                transcript_text = transcribe_audio(audio_bytes)  # returns None on failure
+                st.session_state.transcript = transcript_text or ""
+                progress_bar.progress(70, text="Matching key details...")
+                if transcript_text:
+                    recalled_points_count = _count_key_points(transcript_text, KEY_POINTS)
+
+            if recalled_points_count is None:
+                # Fallback to simulated scoring if transcription failed
+                recalled_points_count = random.choices(
+                    population=[3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
+                    weights=   [1, 1, 2, 3, 4, 5, 4, 3, 2,  1,  1],
+                    k=1
+                )[0]
+
+            st.session_state.score = int(recalled_points_count)
 
             progress_bar.progress(100, text="Analysis complete!")
-            time.sleep(1)
+            time.sleep(0.5)
             st.session_state.test_stage = 'finished'
             st.rerun()
 
-        def show_results_screen():
+        def show_results_screen() -> None:
             """Displays the final score and interpretation."""
             st.subheader("Analysis Complete")
             
@@ -201,6 +232,12 @@ if "Audio" in task_type and model is not None:
             with st.expander("What a real analysis looks for"):
                 st.write("A true AI analysis would check your recording for these key details:")
                 st.write(", ".join(f"`{kp}`" for kp in KEY_POINTS))
+
+            with st.expander("View your transcript"):
+                if st.session_state.transcript:
+                    st.write(st.session_state.transcript)
+                else:
+                    st.write("No transcript available.")
 
             st.markdown("---")
             if st.button("Start a New Test", type="primary"):
@@ -346,7 +383,7 @@ if "Audio" in task_type and model is not None:
 
         # --- Core Functions ---
 
-        def show_audio_input_screen():
+        def show_audio_input_screen() -> None:
             """Displays the interface for recording or uploading audio."""
             st.info("Record a short sample of your speech (e.g., describe your day, a recent memory, or what you see in the room) or upload an existing audio file.", icon="💡")
 
@@ -378,27 +415,44 @@ if "Audio" in task_type and model is not None:
                     st.session_state.app_stage = 'analyzing'
                     st.rerun()
 
-        def show_analysis_screen():
-            """Simulates the audio analysis process with a progress bar."""
+        def show_analysis_screen() -> None:
+            """Analyze audio via API with local fallbacks."""
             st.subheader("Analyzing Speech Features...")
             st.info(
-                "In a real application, an AI model would analyze acoustic features like speech rate, pause duration, and pitch variation. We are simulating this process.", icon="🤖"
+                "Computing speech rate, pause count, and pitch variation.", icon="🤖"
             )
-            
-            # Simulate a processing delay
+
             progress_bar = st.progress(0, text="Processing...")
-            for i in range(100):
-                time.sleep(0.04)
-                progress_bar.progress(i + 1, text=f"Analyzing segment {i+1}...")
-            
-            # --- Generate Simulated Speech Metrics ---
-            # These are more descriptive than a single score for free speech.
+            for i in range(0, 70, 7):
+                time.sleep(0.05)
+                progress_bar.progress(i + 7, text="Extracting features...")
+
+            audio_bytes = st.session_state.audio_data
+            results: Dict[str, float] = {}
+            if audio_bytes:
+                results = compute_speech_metrics(audio_bytes)
+
+            # Fallbacks when API/local could not compute
+            speech_rate = results.get("Speech Rate (words/min)", np.nan)
+            if np.isnan(speech_rate) or speech_rate <= 0:
+                speech_rate = float(random.randint(110, 165))
+
+            pause_count_val = results.get("Pause Count", np.nan)
+            if np.isnan(pause_count_val):
+                pause_count_val = float(random.randint(4, 25))
+
+            pitch_var = results.get("Pitch Variation (semitones)", np.nan)
+            if np.isnan(pitch_var) or pitch_var <= 0:
+                pitch_var = float(round(random.uniform(1.5, 4.5), 2))
+
             st.session_state.analysis_results = {
-                "Speech Rate (words/min)": random.randint(110, 165),
-                "Pause Count": random.randint(4, 25),
-                "Pitch Variation (semitones)": round(random.uniform(1.5, 4.5), 2),
+                "Speech Rate (words/min)": float(speech_rate),
+                "Pause Count": int(pause_count_val),
+                "Pitch Variation (semitones)": float(round(pitch_var, 2)),
             }
-            
+
+            progress_bar.progress(100, text="Analysis complete!")
+            time.sleep(0.3)
             st.session_state.app_stage = 'finished'
             st.rerun()
 

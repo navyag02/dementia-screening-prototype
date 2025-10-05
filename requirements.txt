@@ -4,3 +4,6 @@ numpy
 pandas
 scikit-learn
 joblib
+requests
+soundfile
+st-audiorec
